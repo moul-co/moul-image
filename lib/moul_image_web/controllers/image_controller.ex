@@ -4,92 +4,104 @@ defmodule MoulImageWeb.ImageController do
   @request Req.new(base_url: Application.compile_env(:moul_image, [:image_base_url]))
 
   def thumbnail(conn, params) do
-    hash =
+    etag =
       :sha256
       |> :crypto.hash(conn.query_string)
       |> Base.encode16(case: :lower)
 
-    if get_req_header(conn, "if-none-match")
-       |> List.first() ==
-         hash do
+    if_none_match =
+      conn
+      |> get_req_header("if-none-match")
+      |> List.first()
+
+    if if_none_match == etag do
       send_resp(conn, 304, "Not Modified")
     else
       size = params |> Map.get("size") |> get_size()
 
-      req = Req.get!(@request, url: Map.get(params, "path"))
+      with {:ok, %Req.Response{} = res} <- Req.get(@request, url: Map.get(params, "path")),
+           true <- Map.get(res.headers, "content-type") == ["image/jpeg"],
+           {:ok, image} <- Image.open(res.body),
+           {:ok, thumb} <- Image.thumbnail(image, size) do
+        conn =
+          conn
+          |> put_resp_header("content-type", "image/jpeg")
+          |> put_resp_header("etag", etag)
+          |> put_resp_header("cache-control", "public, max-age=31536000")
+          |> send_chunked(200)
 
-      conn =
+        Image.write!(thumb, conn, suffix: ".jpg", jpg: [quality: 98, progressive: true])
+
         conn
-        |> put_resp_header("content-type", "image/jpeg")
-        |> put_resp_header("etag", hash)
-        |> put_resp_header("cache-control", "public, max-age=31536000")
-        |> send_chunked(200)
-
-      Image.open!(req.body)
-      |> Image.thumbnail!(size)
-      |> Image.write!(conn, suffix: ".jpg", jpg: [quality: 98, progressive: true])
-
-      conn
+      else
+        _ -> send_resp(conn, 400, "Bad Request")
+      end
     end
   end
 
   def thumbhash(conn, params) do
-    hash_path =
+    etag =
       :sha256
       |> :crypto.hash(conn.query_string)
       |> Base.encode16(case: :lower)
 
-    if get_req_header(conn, "if-none-match")
-       |> List.first() ==
-         hash_path do
+    if_none_match =
+      conn
+      |> get_req_header("if-none-match")
+      |> List.first()
+
+    if if_none_match == etag do
       send_resp(conn, 304, "Not Modified")
     else
       encode = Map.get(params, "encode")
       decode = Map.get(params, "decode")
-      boost = Map.get(params, "boost", 1.5)
 
-      req =
-        Req.get!(@request, url: Map.get(params, "path"))
-
-      Image.open!(req.body)
-      |> Image.thumbnail!(100)
-      |> Image.write!("/tmp/#{hash_path}.jpeg")
-
-      cond do
-        is_nil(decode) and not is_nil(encode) ->
-          with {:ok, hash} <- MoulImage.encode_thumbhash("/tmp/#{hash_path}.jpeg") do
-            conn
-            |> put_resp_header("etag", hash_path)
-            |> put_resp_header("cache-control", "public, max-age=31536000")
-            |> send_resp(200, hash)
-          else
-            _ -> send_resp(conn, 400, "Bad Request")
-          end
-
-        not is_nil(decode) and not is_nil(encode) ->
-          with {:ok, hash} <- MoulImage.encode_thumbhash("/tmp/#{hash_path}.jpeg"),
-               {:ok, img} <- MoulImage.decode_thumbhash(hash, boost) do
-            conn =
-              conn
-              |> put_resp_header("content-type", "image/png")
-              |> put_resp_header("etag", hash_path)
-              |> put_resp_header("cache-control", "public, max-age=31536000")
-              |> send_chunked(200)
-
-            img
-            |> String.trim_leading("data:image/png;base64,")
-            |> Base.decode64!()
-            |> Image.open!()
-            |> Image.write!(conn, suffix: ".jpg", jpg: [quality: 98, progressive: true])
-
-            conn
-          else
-            _ -> send_resp(conn, 400, "Bad Request")
-          end
-
-        true ->
-          send_resp(conn, 400, "Bad Request")
+      with {:ok, %Req.Response{} = res} <- Req.get(@request, url: Map.get(params, "path")),
+           true <- Map.get(res.headers, "content-type") == ["image/jpeg"],
+           {:ok, img} <- Image.open(res.body),
+           {:ok, thumb} <- Image.thumbnail(img, 100),
+           {:ok, _} <- Image.write(thumb, "/tmp/#{etag}.jpeg") do
+        process_thumbhash(conn, encode, decode, etag)
+      else
+        _ -> send_resp(conn, 400, "Bad Request")
       end
+    end
+  end
+
+  defp process_thumbhash(conn, nil, nil, _etag), do: send_resp(conn, 400, "Bad Request")
+
+  defp process_thumbhash(conn, _encode, decode, etag) when is_nil(decode) do
+    with {:ok, hash} <- MoulImage.encode_thumbhash("/tmp/#{etag}.jpeg") do
+      conn
+      |> put_resp_header("etag", etag)
+      |> put_resp_header("cache-control", "public, max-age=31536000")
+      |> send_resp(200, hash)
+    else
+      _ -> send_resp(conn, 400, "Bad Request")
+    end
+  end
+
+  defp process_thumbhash(conn, _encode, _decode, etag) do
+    boost = Map.get(conn.query_params, "boost", 1.5)
+
+    with {:ok, hash} <- MoulImage.encode_thumbhash("/tmp/#{etag}.jpeg"),
+         {:ok, img} <- MoulImage.decode_thumbhash(hash, boost) do
+      conn =
+        conn
+        |> put_resp_header("content-type", "image/jpeg")
+        |> put_resp_header("etag", etag)
+        |> put_resp_header("cache-control", "public, max-age=31536000")
+        |> send_chunked(200)
+
+      img
+      |> String.trim_leading("data:image/png;base64,")
+      |> Base.decode64!()
+      |> Image.open!()
+      |> Image.write!(conn, suffix: ".jpg", jpg: [quality: 98, progressive: true])
+
+      conn
+    else
+      _ -> send_resp(conn, 400, "Bad Request")
     end
   end
 
